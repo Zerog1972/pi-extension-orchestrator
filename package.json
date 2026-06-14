@@ -7,7 +7,7 @@
   "author": "",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ZeroG1972/pi-extension-orchestrator"
+    "url": "https://github.com/Zerog1972/pi-extension-orchestrator"
   },
   "pi": {
     "extensions": ["./index.ts"]
