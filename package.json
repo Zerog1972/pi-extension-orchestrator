@@ -1,6 +1,6 @@
 {
   "name": "pi-extension-orchestrator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Orchestrateur de sous-agents pour pi — délègue des tâches à des agents spécialisés avec contrôle de concurrence, priorités et dépendances",
   "keywords": ["pi-package", "pi-extension", "orchestrator", "sub-agents", "agent-orchestration"],
   "license": "MIT",
