@@ -38,6 +38,9 @@ export interface ChainTask {
   cwd?: string;
 }
 
+/** Cycle de vie explicite d'un run (ne pas déduire l'état de `exitCode`) */
+export type RunStatus = "running" | "ok" | "failed" | "cancelled";
+
 export interface UsageStats {
   input: number;
   output: number;
@@ -52,6 +55,10 @@ export interface SingleResult {
   agent: string;
   agentSource: "user" | "project" | "unknown";
   task: string;
+  /** État réel du run. `exitCode` reste exposé pour l'affichage, mais n'est plus la source de vérité. */
+  status: RunStatus;
+  /** Dernière activité observée (outil en cours), pour le suivi live */
+  activity?: string;
   exitCode: number;
   messages: Message[];
   stderr: string;
@@ -101,11 +108,6 @@ export interface OrchestratorState {
 // Affichage / formatting
 // ────────────────────────────────────────
 
-export interface DisplayItem {
-  type: "text";
-  text: string;
-} | {
-  type: "toolCall";
-  name: string;
-  args: Record<string, any>;
-}
+export type DisplayItem =
+  | { type: "text"; text: string }
+  | { type: "toolCall"; name: string; args: Record<string, unknown> };

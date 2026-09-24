@@ -9,6 +9,10 @@
     "type": "git",
     "url": "https://github.com/Zerog1972/pi-extension-orchestrator"
   },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   },
@@ -28,7 +32,11 @@
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

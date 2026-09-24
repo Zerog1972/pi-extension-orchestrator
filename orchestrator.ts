@@ -37,8 +37,28 @@ import type {
 
 const MAX_PARALLEL_TASKS = 8;
 const DEFAULT_MAX_CONCURRENCY = 4;
-const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50 KB
+const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50 KB par sous-agent
+const TOTAL_OUTPUT_CAP = 160 * 1024; // 160 KB agrégées vers le contexte principal
+const STDERR_CAP = 64 * 1024;
+const MAX_LINE_BYTES = 8 * 1024 * 1024; // garde-fou sur une ligne JSONL défectueuse
+
+/** Profondeur d'orchestration, propagée aux enfants via l'environnement */
+export const DEPTH_ENV = "PI_ORCHESTRATOR_DEPTH";
+export const MAX_DEPTH_ENV = "PI_ORCHESTRATOR_MAX_DEPTH";
+export const DEFAULT_MAX_DEPTH = 1;
+
+/** Outils retirés aux sous-agents : un enfant ne doit jamais relancer l'orchestrateur */
+const CHILD_EXCLUDED_TOOLS = ["orchestrator"];
+
+export function readOrchestratorDepth(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number.parseInt(env[DEPTH_ENV] ?? "0", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+export function readMaxOrchestratorDepth(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number.parseInt(env[MAX_DEPTH_ENV] ?? String(DEFAULT_MAX_DEPTH), 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_MAX_DEPTH;
+}
 
 // ────────────────────────────────────────
 // Utilitaires de formatage
@@ -150,7 +170,13 @@ export function getFinalOutput(messages: Message[]): string {
   return "";
 }
 
+export function isRunningResult(result: SingleResult): boolean {
+  return result.status === "running";
+}
+
 export function isFailedResult(result: SingleResult): boolean {
+  if (result.status === "running") return false;
+  if (result.status === "failed" || result.status === "cancelled") return true;
   return (
     result.exitCode !== 0 ||
     result.stopReason === "error" ||
@@ -165,7 +191,7 @@ export function getResultOutput(result: SingleResult): string {
   return getFinalOutput(result.messages) || "(pas de sortie)";
 }
 
-function truncateParallelOutput(output: string): string {
+export function truncateParallelOutput(output: string): string {
   const byteLength = Buffer.byteLength(output, "utf8");
   if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
 
@@ -174,6 +200,23 @@ function truncateParallelOutput(output: string): string {
     truncated = truncated.slice(0, -1);
   }
   return `${truncated}\n\n[Sortie tronquée : ${byteLength - Buffer.byteLength(truncated, "utf8")} octets omis. Sortie complète préservée dans les détails.]`;
+}
+
+/**
+ * Plafond global sur la sortie agrégée d'une exécution parallèle.
+ * Sans lui, N sous-agents verbaux injectent leur intégrale dans le contexte principal.
+ */
+export function capTotalOutput(text: string, cap: number = TOTAL_OUTPUT_CAP): string {
+  const byteLength = Buffer.byteLength(text, "utf8");
+  if (byteLength <= cap) return text;
+
+  let truncated = text.slice(0, cap);
+  while (Buffer.byteLength(truncated, "utf8") > cap) truncated = truncated.slice(0, -1);
+  // Ne pas couper au milieu d'un surrogate pair
+  const last = truncated.charCodeAt(truncated.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) truncated = truncated.slice(0, -1);
+
+  return `${truncated}\n\n[Sortie agrégée tronquée : ${byteLength - Buffer.byteLength(truncated, "utf8")} octets omis. Sorties complètes préservées dans les détails.]`;
 }
 
 export function getDisplayItems(messages: Message[]): DisplayItem[] {
@@ -195,24 +238,44 @@ export function getDisplayItems(messages: Message[]): DisplayItem[] {
 // Contrôle de concurrence
 // ────────────────────────────────────────
 
+/**
+ * Applique `fn` avec N exécutions simultanées.
+ * Si `signal` est aborté, les tâches non encore démarrées ne sont PAS lancées
+ * (trous dans le tableau retourné, à la charge de l'appelant de les combler).
+ */
 async function mapWithConcurrencyLimit<TIn, TOut>(
   items: TIn[],
   concurrency: number,
   fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
+  signal?: AbortSignal,
+): Promise<(TOut | undefined)[]> {
   if (items.length === 0) return [];
   const limit = Math.max(1, Math.min(concurrency, items.length));
-  const results: TOut[] = new Array(items.length);
+  const results: (TOut | undefined)[] = new Array(items.length).fill(undefined);
   let nextIndex = 0;
   const workers = new Array(limit).fill(null).map(async () => {
     while (true) {
       const current = nextIndex++;
       if (current >= items.length) return;
+      if (signal?.aborted) return;
       results[current] = await fn(items[current], current);
     }
   });
   await Promise.all(workers);
-  return workers.length > 0 ? results : [];
+  return results;
+}
+
+/** Résumé lisible de l'activité d'un outil pour le suivi live */
+function summarizeToolActivity(toolName: string, args: unknown): string {
+  const a = (args ?? {}) as Record<string, unknown>;
+  const clip = (value: string, max = 70) => (value.length > max ? `${value.slice(0, max)}…` : value);
+  const candidate =
+    (typeof a.command === "string" && a.command) ||
+    (typeof a.path === "string" && a.path) ||
+    (typeof a.file_path === "string" && a.file_path) ||
+    (typeof a.pattern === "string" && a.pattern) ||
+    "";
+  return candidate ? `${toolName} ${clip(String(candidate))}` : toolName;
 }
 
 // ────────────────────────────────────────
@@ -285,14 +348,33 @@ export async function runSingleAgent(
   const args: string[] = ["--mode", "json", "-p", "--no-session"];
   if (agent.model) args.push("--model", agent.model);
   if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+  // Garde anti-récursion : un sous-agent ne doit pas pouvoir relancer l'orchestrateur.
+  args.push("--exclude-tools", CHILD_EXCLUDED_TOOLS.join(","));
 
   let tmpPromptDir: string | null = null;
   let tmpPromptPath: string | null = null;
+
+  if (signal?.aborted) {
+    return {
+      agent: agentName,
+      agentSource: agent.source,
+      task,
+      status: "cancelled",
+      exitCode: 130,
+      messages: [],
+      stderr: "Sous-agent non lancé : signal d'annulation déjà reçu.",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+      model: agent.model,
+      step,
+      durationMs: 0,
+    };
+  }
 
   const currentResult: SingleResult = {
     agent: agentName,
     agentSource: agent.source,
     task,
+    status: "running",
     exitCode: 0,
     messages: [],
     stderr: "",
@@ -321,19 +403,28 @@ export async function runSingleAgent(
       args.push("--append-system-prompt", tmpPromptPath);
     }
 
-    args.push(`Tâche : ${task}`);
+    // La tâche part sur stdin, pas en argv : évite la limite de ligne de commande
+    // Windows (~32k caractères) quand {previous} est volumineux, et les pièges d'échappement.
     let wasAborted = false;
+    let spawnError: string | null = null;
 
     const exitCode = await new Promise<number>((resolve) => {
       const invocation = getPiInvocation(args);
       const proc: ChildProcess = spawn(invocation.command, invocation.args, {
         cwd: cwd ?? defaultCwd,
         shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
+        env: { ...process.env, [DEPTH_ENV]: String(readOrchestratorDepth() + 1) },
       });
 
-      let buffer = "";
+      if (proc.stdin) {
+        proc.stdin.on("error", () => {
+          /* EPIPE si l'enfant meurt très tôt : traité via exitCode/stderr */
+        });
+        proc.stdin.write(`Tâche : ${task}\n`, "utf-8");
+        proc.stdin.end();
+      }
 
       const processLine = (line: string) => {
         if (!line.trim()) return;
@@ -366,29 +457,57 @@ export async function runSingleAgent(
           emitUpdate();
         }
 
-        if (event.type === "tool_result_end" && event.message) {
-          currentResult.messages.push(event.message as Message);
+        // Événements réels du flux JSON de pi : tool_execution_start/update/end.
+        // (`tool_result_end` n'existe pas ; les messages toolResult arrivent via message_end.)
+        if (event.type === "tool_execution_start") {
+          currentResult.activity = summarizeToolActivity(event.toolName ?? "outil", event.args);
           emitUpdate();
         }
       };
 
-      proc.stdout?.on("data", (data: Buffer) => {
-        buffer += data.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) processLine(line);
-      });
+      // Découpage strict sur LF, puis décodage uniquement de lignes complètes :
+      // un caractère UTF-8 multi-octets coupé entre deux chunks ne peut plus être corrompu.
+      const decoder = new TextDecoder("utf-8");
+      let pending = Buffer.alloc(0);
+      const handleChunk = (chunk: Buffer, isFinal: boolean) => {
+        if (chunk.length > 0) pending = Buffer.concat([pending, chunk]);
+        let lf = pending.indexOf(0x0a);
+        while (lf >= 0) {
+          const lineBuffer = pending.subarray(0, lf);
+          pending = pending.subarray(lf + 1);
+          processLine(decoder.decode(lineBuffer));
+          lf = pending.indexOf(0x0a);
+        }
+        if (pending.length > MAX_LINE_BYTES) {
+          currentResult.stderr += `\n[Ligne JSONL trop longue (> ${MAX_LINE_BYTES} octets), ignorée]`;
+          pending = Buffer.alloc(0);
+        }
+        if (isFinal && pending.length > 0) {
+          processLine(decoder.decode(pending));
+          pending = Buffer.alloc(0);
+        }
+      };
+
+      let stderrCapped = false;
+      proc.stdout?.on("data", (data: Buffer) => handleChunk(data, false));
 
       proc.stderr?.on("data", (data: Buffer) => {
-        currentResult.stderr += data.toString();
+        if (stderrCapped) return;
+        currentResult.stderr += data.toString("utf-8");
+        if (currentResult.stderr.length > STDERR_CAP) {
+          currentResult.stderr = `${currentResult.stderr.slice(0, STDERR_CAP)}\n[stderr tronqué]`;
+          stderrCapped = true;
+        }
       });
 
       proc.on("close", (code) => {
-        if (buffer.trim()) processLine(buffer);
-        resolve(code ?? 0);
+        handleChunk(Buffer.alloc(0), true);
+        resolve(spawnError ? 1 : code ?? 0);
       });
 
-      proc.on("error", () => {
+      proc.on("error", (err) => {
+        spawnError = err.message;
+        if (!currentResult.stderr) currentResult.stderr = `Échec du lancement du sous-agent : ${err.message}`;
         resolve(1);
       });
 
@@ -407,6 +526,12 @@ export async function runSingleAgent(
 
     currentResult.exitCode = exitCode;
     currentResult.durationMs = Date.now() - startTime;
+    currentResult.status = wasAborted
+      ? "cancelled"
+      : exitCode !== 0 || currentResult.stopReason === "error" || currentResult.stopReason === "aborted"
+        ? "failed"
+        : "ok";
+    if (spawnError) currentResult.errorMessage = spawnError;
     if (wasAborted) throw new Error("Sous-agent annulé");
     return currentResult;
   } finally {
@@ -468,6 +593,51 @@ export class Orchestrator {
       .sort((a, b) => a.priority - b.priority || a.createdAt - b.createdAt);
   }
 
+  /**
+   * Annule les tâches en attente dont une dépendance est morte (échouée, annulée ou inconnue).
+   * Sans cela, un échec laissait les dépendants « pending » pour toujours et l'orchestration
+   * se terminait silencieusement avec un résultat partiel.
+   */
+  propagateBlockedTasks(): number {
+    let cancelled = 0;
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const task of this.tasks) {
+        if (task.status !== "pending") continue;
+        const blocked = task.dependencies.some((depId) => {
+          const dep = this.tasks.find((t) => t.id === depId);
+          return !dep || dep.status === "failed" || dep.status === "cancelled";
+        });
+        if (blocked) {
+          task.status = "cancelled";
+          cancelled++;
+          changed = true;
+        }
+      }
+    }
+    return cancelled;
+  }
+
+  /** Tâches restées en attente alors qu'aucune ne peut plus démarrer (dépendances circulaires) */
+  private getDeadlockedTasks(): OrchestratedTask[] {
+    const completed = new Set(
+      this.tasks.filter((t) => t.status === "completed").map((t) => t.id),
+    );
+    return this.tasks.filter(
+      (t) => t.status === "pending" && !t.dependencies.every((depId) => completed.has(depId)),
+    );
+  }
+
+  private describeBlockedTasks(): string {
+    const blocked = this.getDeadlockedTasks();
+    if (blocked.length === 0) return "Aucune tâche exécutable : dépendances insatisfaisables.";
+    const details = blocked
+      .map((t) => `${t.id} (${t.agentName}) ← [${t.dependencies.join(", ")}]`)
+      .join("; ");
+    return `Dépendances circulaires ou insatisfaisables détectées : ${details}`;
+  }
+
   /** Nombre de slots disponibles */
   get availableSlots(): number {
     return Math.max(0, this.maxConcurrency - this.running.size);
@@ -491,7 +661,8 @@ export class Orchestrator {
         const depResult = taskResults.get(depId);
         if (depResult) {
           const output = getFinalOutput(depResult.messages);
-          context = context.replace(`{${depId}}`, output);
+          // Toutes les occurrences du placeholder, pas seulement la première.
+          context = context.split(`{${depId}}`).join(output);
         }
       }
       return context;
@@ -516,6 +687,7 @@ export class Orchestrator {
       const tryScheduleNext = () => {
         if (cancelled) return;
 
+        this.propagateBlockedTasks();
         const ready = this.getReadyTasks();
         const toStart = ready.slice(0, this.availableSlots);
 
@@ -585,10 +757,10 @@ export class Orchestrator {
       // Démarrer les premières tâches
       tryScheduleNext();
 
-      // Si aucune tâche n'est prête (ex: dépendances circulaires)
+      // Tâches restantes impossibles à démarrer : dépendances circulaires -> erreur explicite
       if (this.running.size === 0 && this.tasks.some((t) => t.status === "pending")) {
         if (signal) signal.removeEventListener("abort", abortHandler);
-        resolveAll(results);
+        rejectAll(new Error(this.describeBlockedTasks()));
       }
     });
   }
@@ -681,7 +853,8 @@ export async function executeParallel(
       agent: tasks[i].agent,
       agentSource: "unknown",
       task: tasks[i].task,
-      exitCode: -1, // -1 = en cours
+      status: "running",
+      exitCode: -1, // réservé à l'affichage : l'état réel est porté par `status`
       messages: [],
       stderr: "",
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -690,8 +863,8 @@ export async function executeParallel(
 
   const emitParallelUpdate = () => {
     if (config.onUpdate) {
-      const running = allResults.filter((r) => r.exitCode === -1).length;
-      const done = allResults.filter((r) => r.exitCode !== -1).length;
+      const running = allResults.filter((r) => r.status === "running").length;
+      const done = allResults.length - running;
       config.onUpdate({
         content: [
           { type: "text", text: `Parallèle : ${done}/${allResults.length} terminé(s), ${running} en cours...` },
@@ -702,7 +875,7 @@ export async function executeParallel(
   };
 
   const concurrency = config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
-  const results = await mapWithConcurrencyLimit(tasks, concurrency, async (t, index) => {
+  const settled = await mapWithConcurrencyLimit(tasks, concurrency, async (t, index) => {
     const result = await runSingleAgent(
       config.cwd,
       config.agents,
@@ -722,7 +895,25 @@ export async function executeParallel(
     allResults[index] = result;
     emitParallelUpdate();
     return result;
+  }, config.signal);
+
+  // Tâches jamais démarrées (annulation en cours) : on les matérialise plutôt que de les masquer.
+  const results: SingleResult[] = settled.map((r, index) => {
+    if (r) return r;
+    const cancelled: SingleResult = {
+      agent: tasks[index].agent,
+      agentSource: "unknown",
+      task: tasks[index].task,
+      status: "cancelled",
+      exitCode: 130,
+      messages: [],
+      stderr: "Tâche non lancée : orchestration annulée.",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+    };
+    allResults[index] = cancelled;
+    return cancelled;
   });
+  emitParallelUpdate();
 
   return results;
 }

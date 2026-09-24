@@ -25,6 +25,7 @@ import {
   getFinalOutput,
   getResultOutput,
   isFailedResult,
+  isRunningResult,
 } from "./orchestrator.ts";
 
 // ────────────────────────────────────────
@@ -201,9 +202,10 @@ function renderParallelResult(
   expanded: boolean,
   theme: any,
 ): Container | Text {
-  const running = details.results.filter((r) => r.exitCode === -1).length;
-  const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-  const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
+  const running = details.results.filter(isRunningResult).length;
+  const settledResults = details.results.filter((r) => !isRunningResult(r));
+  const successCount = settledResults.filter((r) => !isFailedResult(r)).length;
+  const failCount = settledResults.filter(isFailedResult).length;
   const isRunning = running > 0;
   const icon = isRunning
     ? theme.fg("warning", "⏳")
@@ -269,7 +271,7 @@ function renderParallelResult(
   let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallèle "))}${theme.fg("accent", status)}`;
   for (const r of details.results) {
     const rIcon =
-      r.exitCode === -1
+      isRunningResult(r)
         ? theme.fg("warning", "⏳")
         : isFailedResult(r)
           ? theme.fg("error", "✗")
@@ -277,7 +279,7 @@ function renderParallelResult(
     const displayItems = getDisplayItems(r.messages);
     text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
     if (displayItems.length === 0)
-      text += `\n${theme.fg("muted", r.exitCode === -1 ? "(en cours...)" : "(pas de sortie)")}`;
+      text += `\n${theme.fg("muted", isRunningResult(r) ? `(en cours… ${r.activity ?? "démarrage"})` : "(pas de sortie)")}`;
     else text += `\n${renderDisplayItems(displayItems, theme, COLLAPSED_CHAIN_ITEMS, false)}`;
   }
   if (!isRunning) {
@@ -297,7 +299,7 @@ function renderChainResult(
   expanded: boolean,
   theme: any,
 ): Container | Text {
-  const successCount = details.results.filter((r) => r.exitCode === 0).length;
+  const successCount = details.results.filter((r) => !isFailedResult(r)).length;
   const icon =
     successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
 
@@ -315,7 +317,7 @@ function renderChainResult(
     );
 
     for (const r of details.results) {
-      const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+      const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
       const displayItems = getDisplayItems(r.messages);
       const finalOutput = getFinalOutput(r.messages);
 
@@ -366,7 +368,7 @@ function renderChainResult(
     theme.fg("toolTitle", theme.bold("chaîne ")) +
     theme.fg("accent", `${successCount}/${details.results.length} étapes`);
   for (const r of details.results) {
-    const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+    const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
     const displayItems = getDisplayItems(r.messages);
     text += `\n\n${theme.fg("muted", `─── Étape ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
     if (displayItems.length === 0) text += `\n${theme.fg("muted", "(pas de sortie)")}`;

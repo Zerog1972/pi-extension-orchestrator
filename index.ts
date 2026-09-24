@@ -26,15 +26,26 @@ import {
 } from "./agents.ts";
 import { DEFAULT_AGENTS_RAW } from "./agents-defaults.ts";
 import {
+  capTotalOutput,
   executeChain,
   executeParallel,
   executeSingle,
   getResultOutput,
   isFailedResult,
-  Orchestrator,
+  readMaxOrchestratorDepth,
+  readOrchestratorDepth,
+  truncateParallelOutput,
 } from "./orchestrator.ts";
 import { renderCall, renderResult } from "./renderer.ts";
-import type { AgentScope, AgentTask, ChainTask, ExecutionDetails, SingleResult } from "./types.ts";
+import type {
+  AgentConfig,
+  AgentScope,
+  AgentTask,
+  ChainTask,
+  ExecutionDetails,
+  RunnerMode,
+  SingleResult,
+} from "./types.ts";
 
 // ────────────────────────────────────────
 // Schémas de paramètres
@@ -122,14 +133,35 @@ export default function (pi: ExtensionAPI) {
       const hasSingle = Boolean(params.agent && params.task);
       const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
+      const mode: RunnerMode = hasChain ? "chain" : hasTasks ? "parallel" : "single";
+
       const makeDetails =
-        (mode: "single" | "parallel" | "chain") =>
+        (asMode: RunnerMode) =>
         (results: SingleResult[]): ExecutionDetails => ({
-          mode,
+          mode: asMode,
           agentScope,
           projectAgentsDir: discovery.projectAgentsDir,
           results,
         });
+
+      // Ceinture de sécurité anti-récursion, en plus de --exclude-tools sur les enfants :
+      // un sous-agent qui parviendrait à appeler l'outil est arrêté par sa profondeur.
+      const depth = readOrchestratorDepth();
+      const maxDepth = readMaxOrchestratorDepth();
+      if (depth > maxDepth) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Profondeur d'orchestration maximale atteinte (${depth} > ${maxDepth}). ` +
+                `Ajustez PI_ORCHESTRATOR_MAX_DEPTH pour autoriser davantage de niveaux.`,
+            },
+          ],
+          details: makeDetails(mode)([]),
+          isError: true,
+        };
+      }
 
       // ── Validation ──
       if (modeCount !== 1) {
@@ -158,11 +190,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Confirmation agents projet ──
-      if (
-        (agentScope === "project" || agentScope === "both") &&
-        confirmProjectAgents &&
-        ctx.hasUI
-      ) {
+      // Les agents projet ne sont approuvés que si le projet est déjà digne de confiance,
+      // ou après confirmation explicite. En l'absence d'UI, personne pour trancher : on refuse.
+      if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents) {
         const requestedAgentNames = new Set<string>();
         if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
         if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
@@ -170,11 +200,27 @@ export default function (pi: ExtensionAPI) {
 
         const projectAgentsRequested = Array.from(requestedAgentNames)
           .map((name) => agents.find((a) => a.name === name))
-          .filter((a): a is typeof agents[number] => a?.source === "project");
+          .filter((a): a is AgentConfig => a?.source === "project");
 
-        if (projectAgentsRequested.length > 0) {
+        if (projectAgentsRequested.length > 0 && !ctx.isProjectTrusted()) {
           const names = projectAgentsRequested.map((a) => a.name).join(", ");
           const dir = discovery.projectAgentsDir ?? "(inconnu)";
+
+          if (!ctx.hasUI) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Refusé : agents du projet local non approuvés (${names}) et aucune interface pour confirmer. ` +
+                    `Approuvez le projet, ou passez confirmProjectAgents:false en connaissance de cause.`,
+                },
+              ],
+              details: makeDetails(mode)([]),
+              isError: true,
+            };
+          }
+
           const ok = await ctx.ui.confirm(
             "Exécuter les agents du projet local ?",
             `Agents : ${names}\nSource : ${dir}\n\nLes agents de projet sont contrôlés par le dépôt. Continuez uniquement pour les dépôts de confiance.`,
@@ -187,7 +233,7 @@ export default function (pi: ExtensionAPI) {
                   text: "Annulé : agents du projet local non approuvés.",
                 },
               ],
-              details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+              details: makeDetails(mode)([]),
             };
           }
         }
@@ -250,22 +296,29 @@ export default function (pi: ExtensionAPI) {
         const results = await executeParallel(config, params.tasks as AgentTask[]);
         const successCount = results.filter((r) => !isFailedResult(r)).length;
 
+        // Plafond par tâche : sans lui, N sorties intégrales inondent le contexte principal.
         const summaries = results.map((r) => {
-          const output = getResultOutput(r);
-          const status = isFailedResult(r)
-            ? `échoué${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-            : "réussi";
-          return `### [${r.agent}] ${status}\n\n${output}`;
+          const output = truncateParallelOutput(getResultOutput(r));
+          const failed = isFailedResult(r);
+          const reason =
+            r.stopReason && r.stopReason !== "stop" && r.stopReason !== "end"
+              ? ` (${r.stopReason})`
+              : "";
+          return `### [${r.agent}] ${failed ? `échoué${reason}` : "réussi"}\n\n${output}`;
         });
 
         return {
           content: [
             {
               type: "text",
-              text: `Parallèle : ${successCount}/${results.length} réussis\n\n${summaries.join("\n\n---\n\n")}`,
+              text: capTotalOutput(
+                `Parallèle : ${successCount}/${results.length} réussis\n\n${summaries.join("\n\n---\n\n")}`,
+              ),
             },
           ],
           details: makeDetails("parallel")(results),
+          // Un échec total doit être perçu comme tel par le modèle, pas comme un succès dégradé.
+          isError: results.length > 0 && successCount === 0,
         };
       }
 
