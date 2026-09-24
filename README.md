@@ -133,21 +133,21 @@ Le LLM appelle cet outil avec l'un des trois modes :
 
 ## Agents disponibles
 
-L'extension embarque **5 agents par défaut** prêts à l'emploi :
+L'extension ne charge **aucun agent implicitement** : seuls comptent les fichiers `.md` posés sur le disque. Elle fournit en revanche 5 définitions prêtes à être écrites par `/agents init` :
 
-| Agent | Rôle | Outils | Modèle |
-|-------|------|--------|--------|
-| `scout` | Exploration rapide | read, grep, find, ls, bash | Deepseek Flash |
-| `planner` | Planification | read, grep, find, ls | Deepseek V4 Pro |
-| `worker` | Implémentation | tous | Deepseek V4 Pro |
-| `reviewer` | Revue de code | read, grep, find, ls, bash | Deepseek V4 Pro |
-| `architect` | Conception architecture | read, grep, find, ls | Deepseek V4 Pro |
+| Agent | Rôle | Outils |
+|-------|------|--------|
+| `scout` | Exploration rapide | read, grep, find, ls, bash |
+| `planner` | Planification | read, grep, find, ls |
+| `worker` | Implémentation | tous |
+| `reviewer` | Revue de code | read, grep, find, ls, bash |
+| `architect` | Conception architecture | read, grep, find, ls |
 
 ### Comportement
 
-1. **Si aucun agent sur le disque** → les agents embarqués sont utilisés automatiquement
-2. **Si des agents existent dans** `~/.pi/agent/agents/` ou `.pi/agents/` → ils prennent le dessus
-3. **Pour personnaliser** → lance `/agents init` qui copie les 5 agents par défaut dans `~/.pi/agent/agents/`, puis édite-les
+1. **Aucun agent sur le disque** → l'outil `orchestrator` échoue avec un message indiquant où créer les définitions (`/agents init`). Aucun repli n'est possible, pour qu'un agent silencieux ne tourne pas à ton insu.
+2. **Des agents existent dans** `~/.pi/agent/agents/` ou `.pi/agents/` → ce sont eux, et eux seuls.
+3. **Pour démarrer** → `/agents init` écrit les 5 définitions ci-dessus dans `~/.pi/agent/agents/` (sans écraser celles existantes), puis édite-les.
 
 ## Créer un agent
 
@@ -162,11 +162,12 @@ Fichier `.md` avec frontmatter YAML :
 name: mon-agent
 description: Ce que fait mon agent
 tools: read, grep, find, ls
-model: deepseek-flash
 ---
 
 Tu es un agent spécialisé dans...
 ```
+
+`model:` est facultatif : absent, le sous-agent hérite du modèle de la session appelante. Le renseigner force ce modèle (`--model`) et impose que l'endpoint correspondant soit joignable.
 
 Emplacements :
 - `~/.pi/agent/agents/*.md` — agents utilisateur (toujours chargés)

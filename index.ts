@@ -163,6 +163,27 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      // ── Aucun agent sur le disque : on s'arrête là, pas de repli implicite ──
+      if (agents.length === 0) {
+        const dirs = [`~/.pi/agent/agents (${path.join(getAgentDir(), "agents")})`];
+        if (agentScope !== "user" && discovery.projectAgentsDir) {
+          dirs.push(discovery.projectAgentsDir);
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Aucun agent trouvé dans ${dirs.join(" ni ")}. ` +
+                `Crée les définitions avec /agents init, ou ajuste agentScope ` +
+                `("user", "project", "both").`
+            },
+          ],
+          details: makeDetails(mode)([]),
+          isError: true,
+        };
+      }
+
       // ── Validation ──
       if (modeCount !== 1) {
         const available = formatAgentList(agents, 10);
@@ -492,7 +513,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`${agents.length} agent(s) disponible(s) : ${text}\n/agents init pour personnaliser`, "info");
     } else {
       ctx.ui.notify(
-        "Orchestrateur chargé. Agents par défaut utilisés. /agents init pour les personnaliser.",
+        `Orchestrateur chargé : aucun agent trouvé dans ${path.join(getAgentDir(), "agents")}. /agents init pour créer les définitions par défaut.`,
         "warning",
       );
     }

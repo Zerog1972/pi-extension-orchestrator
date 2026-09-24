@@ -3,7 +3,9 @@
  *
  * Cherche les définitions d'agents dans :
  *   - ~/.pi/agent/agents/*.md   (utilisateur)
- *   - .pi/agents/*.md           (projet local)
+ *   - .pi/agents/*.md           (projet local, en remontant depuis cwd)
+ *
+ * Rien n'est embarqué : ce sont les seuls agents reconnus.
  *
  * Chaque fichier .md contient un frontmatter YAML avec :
  *   name, description, tools, model
@@ -13,7 +15,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_AGENTS } from "./agents-defaults.ts";
 import type { AgentConfig, AgentScope } from "./types.ts";
 
 // ────────────────────────────────────────
@@ -100,15 +101,10 @@ export interface AgentDiscoveryResult {
   projectAgentsDir: string | null;
 }
 
-/** Charge les agents par défaut embarqués dans l'extension (fallback) */
-function loadDefaultAgents(): AgentConfig[] {
-  return DEFAULT_AGENTS.map((a) => ({
-    ...a,
-    source: "user" as const,
-    filePath: "(embarqué)",
-  }));
-}
-
+/**
+ * Liste les agents définis sur le disque. Aucun repli implicite : sans fichier
+ * .md, la liste est vide et l'appelant doit le signaler à l'utilisateur.
+ */
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
   const userDir = path.join(getAgentDir(), "agents");
   const projectAgentsDir = findNearestProjectAgentsDir(cwd);
@@ -119,16 +115,6 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
     : loadAgentsFromDir(projectAgentsDir, "project");
 
   const agentMap = new Map<string, AgentConfig>();
-
-  // Les agents par défaut embarqués servent de base (priorité la plus basse)
-  // Ils sont utilisés uniquement si aucun agent n'est trouvé sur le disque
-  const hasDiskAgents = userAgents.length > 0 || projectAgents.length > 0;
-
-  if (!hasDiskAgents) {
-    for (const agent of loadDefaultAgents()) {
-      agentMap.set(agent.name, agent);
-    }
-  }
 
   // En mode "both", les agents projet écrasent les agents user de même nom
   if (scope === "both") {
